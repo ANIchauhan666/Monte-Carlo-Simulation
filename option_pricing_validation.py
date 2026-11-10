@@ -20,19 +20,19 @@ Give it a symbol; everything else is fetched or calculated, and charts are drawn
                                                    Asian/barrier prices (one file per expiry)
 
 Usage:
-  python mc_option_pricing.py AAPL                       # ladder of expiries, prices + charts
-  python mc_option_pricing.py AAPL --days 45             # YOU choose the time: 45 days
-  python mc_option_pricing.py AAPL --days 2026-12-18     # ...or an exact expiry date
-  python mc_option_pricing.py AAPL --days 2w,3m,1y       # ...or shorthand / a list
-  python mc_option_pricing.py AAPL --list-expiries       # see which expiry dates exist
-  python mc_option_pricing.py AAPL TSLA --days pick --csv results.csv
-  python mc_option_pricing.py AAPL --days 45 --strikes 200,210,220 --pairs 20000
-  python mc_option_pricing.py AAPL --no-show             # save the PNG charts, open no windows
-  python mc_option_pricing.py AAPL --no-plot             # numbers only
-  python mc_option_pricing.py                            # prompts: symbol, then YOUR expiry choice
+  python option_pricing_validation.py AAPL                       # ladder of expiries, prices + charts
+  python option_pricing_validation.py AAPL --days 45             # YOU choose the time: 45 days
+  python option_pricing_validation.py AAPL --days 2026-12-18     # ...or an exact expiry date
+  python option_pricing_validation.py AAPL --days 2w,3m,1y       # ...or shorthand / a list
+  python option_pricing_validation.py AAPL --list-expiries       # see which expiry dates exist
+  python option_pricing_validation.py AAPL TSLA --days pick --csv results.csv
+  python option_pricing_validation.py AAPL --days 45 --strikes 200,210,220 --pairs 20000
+  python option_pricing_validation.py AAPL --no-show             # save the PNG charts, open no windows
+  python option_pricing_validation.py AAPL --no-plot             # numbers only
+  python option_pricing_validation.py                            # prompts: symbol, then YOUR expiry choice
 Overrides (all optional): --r --q --sigma --strikes --days --pairs --seed --plot-dir
 
-Scheduling (weekdays 16:30):  30 16 * * 1-5  cd /path && python3 mc_option_pricing.py AAPL TSLA --csv results.csv --no-show
+Scheduling (weekdays 16:30):  30 16 * * 1-5  cd /path && python3 option_pricing_validation.py AAPL TSLA --csv results.csv --no-show
 (On a machine with no display, such as cron or a server, charts are saved only; no window is opened.)
 """
 import argparse
@@ -42,7 +42,7 @@ import os
 import re
 import sys
 import warnings
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 
 import numpy as np
 import pandas as pd
@@ -344,7 +344,10 @@ def years_to_expiry(expiry: str, currency: str) -> float:
     tz = _get_market_tz(currency)
     if spec and tz is not None:
         close = datetime(exp.year, exp.month, exp.day, spec[1], spec[2], tzinfo=tz)
-        secs = (close - datetime.now(tz)).total_seconds()
+        now = datetime.now(tz)
+        secs = (
+            close.astimezone(timezone.utc) - now.astimezone(timezone.utc)
+        ).total_seconds()
         if secs <= 0:
             raise ValueError(f"Expiry {expiry} is not in the future at the exchange close.")
         return secs / (365 * 86400)
@@ -405,7 +408,9 @@ def quote_price(row):
     bid, ask, last = _num(row, "bid"), _num(row, "ask"), _num(row, "lastPrice")
     if bid > 0 and ask >= bid:
         mid = (bid + ask) / 2
-        return (mid, "mid") if (ask - bid) / mid <= 0.5 else (None, "wide")
+        if (ask - bid) / mid <= 0.5:
+            return mid, "mid"
+        return (last, "last") if last > 0 else (None, "wide")
     return (last, "last") if last > 0 else (None, "none")
 
 
@@ -954,7 +959,8 @@ def price_expiry(ctx, chain, days, T, curve, opt) -> dict:
         near = sorted(near, key=lambda p: abs(p["strike"] - S0))[: opt.nstrikes]
         strikes = sorted(p["strike"] for p in near)
     else:
-        strikes = [round(S0 * m, 2) for m in (0.90, 0.95, 1.00, 1.05, 1.10)]
+        moneyness = [1.0] if opt.nstrikes == 1 else np.linspace(0.90, 1.10, opt.nstrikes)
+        strikes = [float(S0 * m) for m in moneyness]
     market = {p["strike"]: p for p in pts}
 
     path_cache = BoundedPathCache()
@@ -1419,6 +1425,13 @@ def plot_results(ctx, results, pairs=2500, seed=42, output_dir="charts", show=Tr
 
 
 # ========== 10. Validation: Monte Carlo vs Black-Scholes ==========
+def _percentage_error(estimate, benchmark):
+    error = abs(estimate - benchmark)
+    if benchmark != 0:
+        return error / abs(benchmark) * 100
+    return 0.0 if error == 0 else math.inf
+
+
 def validate_european_prices(S0=100, K=100, r=0.05, q=0.02, sigma=0.20, T=1.0, pairs=25000, seed=42):
     """
     Compare Monte Carlo European option prices against analytical Black-Scholes prices.
@@ -1450,8 +1463,8 @@ def validate_european_prices(S0=100, K=100, r=0.05, q=0.02, sigma=0.20, T=1.0, p
 
     abs_error_call = abs(mc_call - bs_call)
     abs_error_put = abs(mc_put - bs_put)
-    pct_error_call = (abs_error_call / bs_call * 100) if bs_call > 0 else 0.0
-    pct_error_put = (abs_error_put / bs_put * 100) if bs_put > 0 else 0.0
+    pct_error_call = _percentage_error(mc_call, bs_call)
+    pct_error_put = _percentage_error(mc_put, bs_put)
 
     print("\n" + "-" * 80)
     print(f"{'Option Type':<15} {'Monte Carlo':>15} {'Black-Scholes':>15} {'Abs Error':>12} {'% Error':>10}")
@@ -1721,7 +1734,11 @@ def put_call_parity_validation(S0=100, K=100, r=0.05, q=0.02, sigma=0.20, T=1.0,
     bs_put = bs_price(S0, K, r, q, sigma, T, "put")
 
     mc_lhs = mc_call - mc_put
-    _, mc_lhs_se = pair_mean_se(values_call - values_put)
+    _, mc_lhs_se = cv_estimate(
+        values_call - values_put,
+        math.exp(-r * T) * paths[-1],
+        S0 * math.exp(-q * T),
+    )
 
     bs_lhs = bs_call - bs_put
     rhs = S0 * math.exp(-q * T) - K * math.exp(-r * T)
@@ -1933,8 +1950,8 @@ def multiple_scenario_validation(base_seed=42, pairs=25000):
         mc_call, se_call, _, _ = european_mc(paths, S0, K, r, q, T, "call")
         mc_put, se_put, _, _ = european_mc(paths, S0, K, r, q, T, "put")
 
-        call_err_pct = abs(mc_call - bs_call) / bs_call * 100 if bs_call > 0.01 else 0.0
-        put_err_pct = abs(mc_put - bs_put) / bs_put * 100 if bs_put > 0.01 else 0.0
+        call_err_pct = _percentage_error(mc_call, bs_call)
+        put_err_pct = _percentage_error(mc_put, bs_put)
 
         call_in_ci = abs(mc_call - bs_call) <= 1.96 * se_call
         put_in_ci = abs(mc_put - bs_put) <= 1.96 * se_put
@@ -2085,12 +2102,15 @@ def empirical_ci_coverage(
     print("STATISTICAL INTERPRETATION")
     print(f"{'='*80}")
 
-    tolerance = 3.0
+    tolerance = 1.96 * 100 * math.sqrt(0.95 * 0.05 / n_experiments)
     call_status = "PASS" if abs(call_coverage_pct - 95.0) <= tolerance else "WARNING"
     put_status = "PASS" if abs(put_coverage_pct - 95.0) <= tolerance else "WARNING"
 
     print("\n  Note: Empirical coverage is subject to sampling variation.")
-    print(f"  With {n_experiments} experiments, we expect ±{tolerance:.1f}% variation around 95%.")
+    print(
+        f"  With {n_experiments} experiments, the approximate 95% sampling tolerance "
+        f"is ±{tolerance:.2f} percentage points around 95%."
+    )
 
     if call_status == "PASS" and put_status == "PASS":
         print("\n  ✓ PASS: Both call and put coverage are within expected range")
@@ -2114,7 +2134,8 @@ def empirical_ci_coverage(
         axes[0].plot(experiments, call_cumulative, linewidth=2, label="Empirical Coverage")
         axes[0].axhline(95, color="red", linestyle="--", linewidth=2, label="Expected 95%")
         axes[0].axhline(
-            95 + tolerance, color="orange", linestyle=":", linewidth=1, alpha=0.5, label=f"±{tolerance}% tolerance"
+            95 + tolerance, color="orange", linestyle=":", linewidth=1, alpha=0.5,
+            label=f"±{tolerance:.2f} percentage points",
         )
         axes[0].axhline(95 - tolerance, color="orange", linestyle=":", linewidth=1, alpha=0.5)
         axes[0].set_xlabel("Number of Experiments", fontsize=11)
@@ -2165,6 +2186,7 @@ def empirical_ci_coverage(
         "call_count": call_coverage_count,
         "put_count": put_coverage_count,
         "n_experiments": n_experiments,
+        "tolerance": tolerance,
         "call_status": call_status,
         "put_status": put_status,
     }
@@ -2214,21 +2236,21 @@ def greeks_validation(S0=100, K=100, r=0.05, q=0.02, sigma=0.20, T=1.0, pairs=25
     mc_delta = mc_greeks_call["delta"]
     bs_delta = bs_greeks_call["delta"]
     delta_err = abs(mc_delta - bs_delta)
-    delta_pct = (delta_err / abs(bs_delta) * 100) if abs(bs_delta) > 0.001 else 0.0
+    delta_pct = _percentage_error(mc_delta, bs_delta)
     delta_status = "PASS" if delta_pct < 5.0 else "WARNING"
     print(f"{'Delta':<14} {mc_delta:>15.6f} {bs_delta:>15.6f} {delta_err:>12.6f} {delta_pct:>9.3f}% {delta_status:>8}")
 
     mc_gamma = mc_greeks_call["gamma"]
     bs_gamma = bs_greeks_call["gamma"]
     gamma_err = abs(mc_gamma - bs_gamma)
-    gamma_pct = (gamma_err / abs(bs_gamma) * 100) if abs(bs_gamma) > 0.001 else 0.0
+    gamma_pct = _percentage_error(mc_gamma, bs_gamma)
     gamma_status = "PASS" if gamma_pct < 10.0 else "WARNING"
     print(f"{'Gamma':<14} {mc_gamma:>15.6f} {bs_gamma:>15.6f} {gamma_err:>12.6f} {gamma_pct:>9.3f}% {gamma_status:>8}")
 
     mc_vega = mc_vega_call_display
     bs_vega = bs_vega_call_display
     vega_err = abs(mc_vega - bs_vega)
-    vega_pct = (vega_err / abs(bs_vega) * 100) if abs(bs_vega) > 0.001 else 0.0
+    vega_pct = _percentage_error(mc_vega, bs_vega)
     vega_status = "PASS" if vega_pct < 10.0 else "WARNING"
     print(
         f"{'Vega (per 1.0)':<14} {mc_vega:>15.6f} {bs_vega:>15.6f} {vega_err:>12.6f} {vega_pct:>9.3f}% {vega_status:>8}"
@@ -2237,7 +2259,7 @@ def greeks_validation(S0=100, K=100, r=0.05, q=0.02, sigma=0.20, T=1.0, pairs=25
     mc_theta = mc_theta_call_display
     bs_theta = bs_theta_call_display
     theta_err = abs(mc_theta - bs_theta)
-    theta_pct = (theta_err / abs(bs_theta) * 100) if abs(bs_theta) > 0.001 else 0.0
+    theta_pct = _percentage_error(mc_theta, bs_theta)
     theta_status = "PASS" if theta_pct < 15.0 else "WARNING"
     print(
         f"{'Theta (per yr)':<14} {mc_theta:>15.6f} {bs_theta:>15.6f} {theta_err:>12.6f} {theta_pct:>9.3f}% {theta_status:>8}"
@@ -2256,7 +2278,7 @@ def greeks_validation(S0=100, K=100, r=0.05, q=0.02, sigma=0.20, T=1.0, pairs=25
     mc_delta_put = mc_greeks_put["delta"]
     bs_delta_put = bs_greeks_put["delta"]
     delta_err_put = abs(mc_delta_put - bs_delta_put)
-    delta_pct_put = (delta_err_put / abs(bs_delta_put) * 100) if abs(bs_delta_put) > 0.001 else 0.0
+    delta_pct_put = _percentage_error(mc_delta_put, bs_delta_put)
     delta_status_put = "PASS" if delta_pct_put < 5.0 else "WARNING"
     print(
         f"{'Delta':<14} {mc_delta_put:>15.6f} {bs_delta_put:>15.6f} {delta_err_put:>12.6f} {delta_pct_put:>9.3f}% {delta_status_put:>8}"
@@ -2265,7 +2287,7 @@ def greeks_validation(S0=100, K=100, r=0.05, q=0.02, sigma=0.20, T=1.0, pairs=25
     mc_gamma_put = mc_greeks_put["gamma"]
     bs_gamma_put = bs_greeks_put["gamma"]
     gamma_err_put = abs(mc_gamma_put - bs_gamma_put)
-    gamma_pct_put = (gamma_err_put / abs(bs_gamma_put) * 100) if abs(bs_gamma_put) > 0.001 else 0.0
+    gamma_pct_put = _percentage_error(mc_gamma_put, bs_gamma_put)
     gamma_status_put = "PASS" if gamma_pct_put < 10.0 else "WARNING"
     print(
         f"{'Gamma':<14} {mc_gamma_put:>15.6f} {bs_gamma_put:>15.6f} {gamma_err_put:>12.6f} {gamma_pct_put:>9.3f}% {gamma_status_put:>8}"
@@ -2274,7 +2296,7 @@ def greeks_validation(S0=100, K=100, r=0.05, q=0.02, sigma=0.20, T=1.0, pairs=25
     mc_vega_put = mc_vega_put_display
     bs_vega_put = bs_vega_put_display
     vega_err_put = abs(mc_vega_put - bs_vega_put)
-    vega_pct_put = (vega_err_put / abs(bs_vega_put) * 100) if abs(bs_vega_put) > 0.001 else 0.0
+    vega_pct_put = _percentage_error(mc_vega_put, bs_vega_put)
     vega_status_put = "PASS" if vega_pct_put < 10.0 else "WARNING"
     print(
         f"{'Vega (per 1.0)':<14} {mc_vega_put:>15.6f} {bs_vega_put:>15.6f} {vega_err_put:>12.6f} {vega_pct_put:>9.3f}% {vega_status_put:>8}"
@@ -2283,7 +2305,7 @@ def greeks_validation(S0=100, K=100, r=0.05, q=0.02, sigma=0.20, T=1.0, pairs=25
     mc_theta_put = mc_theta_put_display
     bs_theta_put = bs_theta_put_display
     theta_err_put = abs(mc_theta_put - bs_theta_put)
-    theta_pct_put = (theta_err_put / abs(bs_theta_put) * 100) if abs(bs_theta_put) > 0.001 else 0.0
+    theta_pct_put = _percentage_error(mc_theta_put, bs_theta_put)
     theta_status_put = "PASS" if theta_pct_put < 15.0 else "WARNING"
     print(
         f"{'Theta (per yr)':<14} {mc_theta_put:>15.6f} {bs_theta_put:>15.6f} {theta_err_put:>12.6f} {theta_pct_put:>9.3f}% {theta_status_put:>8}"
@@ -2368,8 +2390,13 @@ def final_validation_dashboard():
     print("\n[2/8] Running convergence analysis...")
     try:
         test2 = convergence_analysis(S0, K, r, q, sigma, T, seed)
-        errors = [r["pct_err_call"] for r in test2]
-        if errors[-1] < errors[0] or errors[-1] < 0.5:
+        call_errors = [r["pct_err_call"] for r in test2]
+        put_errors = [r["pct_err_put"] for r in test2]
+        if (
+            call_errors[-1] < call_errors[0]
+            and put_errors[-1] < put_errors[0]
+            and max(call_errors[-1], put_errors[-1]) < 0.5
+        ):
             results["Convergence"] = "PASS"
         else:
             results["Convergence"] = "WARNING"
@@ -2408,12 +2435,13 @@ def final_validation_dashboard():
     try:
         test6 = multiple_scenario_validation(seed, pairs)
         fail_count = sum(1 for r in test6 if "FAIL" in r["status"])
-        if fail_count == 0:
-            results["Multiple Scenarios"] = "PASS"
-        elif fail_count <= 1:
+        warn_count = sum(1 for r in test6 if "WARN" in r["status"])
+        if fail_count > 1:
+            results["Multiple Scenarios"] = "FAIL"
+        elif fail_count or warn_count:
             results["Multiple Scenarios"] = "WARNING"
         else:
-            results["Multiple Scenarios"] = "FAIL"
+            results["Multiple Scenarios"] = "PASS"
     except Exception as e:
         print(f"  ✗ Error: {e}")
         results["Multiple Scenarios"] = "FAIL"

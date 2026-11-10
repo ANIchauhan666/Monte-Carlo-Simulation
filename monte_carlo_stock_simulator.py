@@ -24,7 +24,7 @@ HEADERS = {
 
 
 # ========== 3. Data retrieval ==========
-def get_ohlc(symbol: str, period: str = "1d") -> dict:
+def get_ohlc(symbol: str, period: str = "1y") -> dict:
     params = {"range": period, "interval": "1d"}
     response = None
 
@@ -79,15 +79,16 @@ def get_ohlc(symbol: str, period: str = "1d") -> dict:
             and h >= l > 0
         ]
 
-        if not valid_rows:
-            raise ValueError("No usable OHLC observations")
+        if len(valid_rows) < 20:
+            raise ValueError("At least 20 usable daily OHLC observations are required")
 
         return {
             "symbol": result["meta"].get("symbol", symbol),
             "currency": result["meta"].get("currency", ""),
-            "open": valid_rows[0][0],
-            "high": max(row[1] for row in valid_rows),
-            "low": min(row[2] for row in valid_rows),
+            "open": valid_rows[-1][0],
+            "log_high_low": np.array(
+                [math.log(row[1] / row[2]) for row in valid_rows]
+            ),
             "from": datetime.fromtimestamp(
                 valid_rows[0][3], tz=timezone.utc
             ).strftime("%Y-%m-%d"),
@@ -192,16 +193,9 @@ def main() -> None:
             fundamentals["current_price"]
             or stock["open"]
         )
-        high = stock["high"]
-        low = stock["low"]
-
-        if high < low or low <= 0:
-            print("Invalid historical price range.")
-            continue
-
         sigma = math.sqrt(
-            252 / (4 * math.log(2))
-        ) * math.log(high / low)
+            252 * np.mean(stock["log_high_low"] ** 2) / (4 * math.log(2))
+        )
 
         years = 1
         steps = 360
@@ -210,14 +204,14 @@ def main() -> None:
 
         expected_return = 0.05
         if (
-            fundamentals["dividend_yield"] is not None
+            fundamentals["dividend_per_share"] is not None
             and fundamentals["eps"] is not None
             and fundamentals["pe_ratio"] is not None
             and fundamentals["current_price"] not in (None, 0)
         ):
             expected_return = (
                 (
-                    fundamentals["dividend_yield"]
+                    fundamentals["dividend_per_share"]
                     + fundamentals["eps"] * fundamentals["pe_ratio"]
                 )
                 / fundamentals["current_price"]

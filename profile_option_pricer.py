@@ -17,7 +17,7 @@ from types import SimpleNamespace
 import numpy as np
 import pandas as pd
 
-import test_european_pricing as pricer
+import monte_carlo_option_pricer as pricer
 from bounded_path_cache import BoundedPathCache
 
 

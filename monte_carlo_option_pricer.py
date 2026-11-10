@@ -20,19 +20,19 @@ Give it a symbol; everything else is fetched or calculated, and charts are drawn
                                                    Asian/barrier prices (one file per expiry)
 
 Usage:
-  python mc_option_pricing.py AAPL                       # ladder of expiries, prices + charts
-  python mc_option_pricing.py AAPL --days 45             # YOU choose the time: 45 days
-  python mc_option_pricing.py AAPL --days 2026-12-18     # ...or an exact expiry date
-  python mc_option_pricing.py AAPL --days 2w,3m,1y       # ...or shorthand / a list
-  python mc_option_pricing.py AAPL --list-expiries       # see which expiry dates exist
-  python mc_option_pricing.py AAPL TSLA --days pick --csv results.csv
-  python mc_option_pricing.py AAPL --days 45 --strikes 200,210,220 --pairs 20000
-  python mc_option_pricing.py AAPL --no-show             # save the PNG charts, open no windows
-  python mc_option_pricing.py AAPL --no-plot             # numbers only
-  python mc_option_pricing.py                            # prompts: symbol, then YOUR expiry choice
+  python monte_carlo_option_pricer.py AAPL                       # ladder of expiries, prices + charts
+  python monte_carlo_option_pricer.py AAPL --days 45             # YOU choose the time: 45 days
+  python monte_carlo_option_pricer.py AAPL --days 2026-12-18     # ...or an exact expiry date
+  python monte_carlo_option_pricer.py AAPL --days 2w,3m,1y       # ...or shorthand / a list
+  python monte_carlo_option_pricer.py AAPL --list-expiries       # see which expiry dates exist
+  python monte_carlo_option_pricer.py AAPL TSLA --days pick --csv results.csv
+  python monte_carlo_option_pricer.py AAPL --days 45 --strikes 200,210,220 --pairs 20000
+  python monte_carlo_option_pricer.py AAPL --no-show             # save the PNG charts, open no windows
+  python monte_carlo_option_pricer.py AAPL --no-plot             # numbers only
+  python monte_carlo_option_pricer.py                            # prompts: symbol, then YOUR expiry choice
 Overrides (all optional): --r --q --sigma --strikes --days --pairs --seed --plot-dir
 
-Scheduling (weekdays 16:30):  30 16 * * 1-5  cd /path && python3 mc_option_pricing.py AAPL TSLA --csv results.csv --no-show
+Scheduling (weekdays 16:30):  30 16 * * 1-5  cd /path && python3 monte_carlo_option_pricer.py AAPL TSLA --csv results.csv --no-show
 (On a machine with no display, such as cron or a server, charts are saved only; no window is opened.)
 """
 import argparse
@@ -42,7 +42,7 @@ import os
 import re
 import sys
 import warnings
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 
 import numpy as np
 import pandas as pd
@@ -307,7 +307,10 @@ def years_to_expiry(expiry: str, currency: str) -> float:
             tz = None
         if tz is not None:
             close = datetime(exp.year, exp.month, exp.day, spec[1], spec[2], tzinfo=tz)
-            secs = (close - datetime.now(tz)).total_seconds()
+            now = datetime.now(tz)
+            secs = (
+                close.astimezone(timezone.utc) - now.astimezone(timezone.utc)
+            ).total_seconds()
             if secs <= 0:
                 raise ValueError(f"Expiry {expiry} is not in the future at the exchange close.")
             return secs / (365 * 86400)
@@ -364,7 +367,9 @@ def quote_price(row):
     bid, ask, last = _num(row, "bid"), _num(row, "ask"), _num(row, "lastPrice")
     if bid > 0 and ask >= bid:
         mid = (bid + ask) / 2
-        return (mid, "mid") if (ask - bid) / mid <= 0.5 else (None, "wide")
+        if (ask - bid) / mid <= 0.5:
+            return mid, "mid"
+        return (last, "last") if last > 0 else (None, "wide")
     return (last, "last") if last > 0 else (None, "none")
 
 
@@ -881,7 +886,8 @@ def price_expiry(ctx, chain, days, T, curve, opt) -> dict:
         near = sorted(near, key=lambda p: abs(p["strike"] - S0))[:opt.nstrikes]
         strikes = sorted(p["strike"] for p in near)
     else:
-        strikes = [round(S0 * m, 2) for m in (0.90, 0.95, 1.00, 1.05, 1.10)]
+        moneyness = [1.0] if opt.nstrikes == 1 else np.linspace(0.90, 1.10, opt.nstrikes)
+        strikes = [float(S0 * m) for m in moneyness]
     market = {p["strike"]: p for p in pts}
 
     path_cache = BoundedPathCache()
